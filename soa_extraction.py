@@ -66,8 +66,9 @@ DIRECT_MIME_TYPES = {
 
 def extract_msg_contents(msg_path):
     print(f"Reading MSG File: {msg_path}")
-    msg = extract_msg.Message(msg_path)
-    
+    return _extract_message(extract_msg.Message(msg_path))
+
+def _extract_message(msg):
     # 1. Extract Email Body & Metadata
     email_sender = msg.sender
     email_subject = msg.subject
@@ -96,6 +97,22 @@ def extract_msg_contents(msg_path):
         
         # Read raw content
         content_bytes = att.data
+        if not isinstance(content_bytes, (bytes, bytearray)):
+            # A forwarded email often carries the original email (and the SOA
+            # attached to it) as an embedded .msg. Read it instead of crashing.
+            if content_bytes is not None and hasattr(content_bytes, "attachments"):
+                print(f"   Reading embedded email '{att_name}'.")
+                nested = _extract_message(content_bytes)
+                attachments_extracted.append({
+                    "filename": att_name,
+                    "extension": ext,
+                    "bytes_length": len(nested["body_html"]),
+                    "word_text": nested["body_html"],
+                })
+                attachments_extracted.extend(nested["attachments"])
+            else:
+                print(f"   Skipping attachment '{att_name}' with no readable content.")
+            continue
         
         attachment_info = {
             "filename": att_name,
@@ -338,6 +355,16 @@ def call_llm_for_extraction(parsed_email: dict) -> tuple[ExtractedSOA, dict[str,
         )
     )
     
+    candidate = response.candidates[0] if response.candidates else None
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason == types.FinishReason.MAX_TOKENS:
+        raise RuntimeError(
+            "Gemini stopped before finishing the extraction (output limit reached). "
+            "Split this statement into smaller files and run again."
+        )
+    if not response.text:
+        raise RuntimeError(f"Gemini returned no extraction result (finish reason: {finish_reason}).")
+
     usage = response.usage_metadata
     usage_info = {
         "prompt_tokens": usage.prompt_token_count if usage else 0,

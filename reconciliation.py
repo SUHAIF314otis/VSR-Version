@@ -46,16 +46,27 @@ def format_date_ddmmyyyy(val):
         return str(val).strip()
 
 
-def get_month_name(val):
+def _to_datetime(val):
     if pd.isna(val) or val is None or str(val).strip() in ["", "NaT", "nan", "None"]:
-        return ""
+        return None
     try:
-        if hasattr(val, "strftime"):
-            return val.strftime("%B")
-        dt = pd.to_datetime(val, dayfirst=True)
-        return dt.strftime("%B")
+        return val if hasattr(val, "strftime") else pd.to_datetime(val, dayfirst=True)
     except Exception:
-        return ""
+        return None
+
+
+def payment_cycle_status(due_date, as_of):
+    """Name the payment cycle; an overdue held invoice goes in the current cycle."""
+    dt = _to_datetime(due_date)
+    if dt is None:
+        return "Ready for Payment and scheduled for Payment Cycle"
+    cycle = (dt.year, dt.month)
+    if cycle < (as_of.year, as_of.month):
+        cycle = (as_of.year, as_of.month)
+    month_name = pd.Timestamp(year=cycle[0], month=cycle[1], day=1).strftime("%B")
+    if cycle[0] != as_of.year:
+        month_name += f"'{cycle[0] % 100:02d}"
+    return f"Ready for Payment and scheduled for {month_name} Payment Cycle"
 
 
 def parse_amount(value, *, source, row_number, required=False):
@@ -113,7 +124,6 @@ def validate_soa_dataframe(df_soa):
             row.get("Amount( Original )"),
             source="SOA data",
             row_number=offset,
-            required=True,
         )
         parse_amount(
             row.get("Open amount"),
@@ -188,125 +198,185 @@ def _format_amount(value):
     return "unavailable" if value is None else f"{value:,.2f}"
 
 
-def _jde_status(matched_jde, amount_matches):
-    if not matched_jde or not amount_matches:
-        return "", "", ""
+UNDER_PROCESSING = (
+    "Under Processing and will be reviewed by the team, should more information be required we will be in touch"
+)
+MISSING_IN_LEDGER = "Missing in ledger please submit your invoice to APukinvoices@otis.com"
 
-    reg_code = matched_jde["Reg Code"]
-    pay_stat = matched_jde["Pay Stat"]
-    if reg_code in ["L", ""]:
-        if pay_stat == "P":
-            payment_date = format_date_ddmmyyyy(matched_jde.get("Payment Date"))
-            return (
-                f"Paid in full on {payment_date}" if payment_date else "Paid in full",
-                "",
-                "paid",
-            )
-        if pay_stat == "H":
-            month_name = get_month_name(matched_jde.get("Due Date"))
-            return (
-                f"Ready for Payment and scheduled for {month_name} Payment Cycle"
-                if month_name
-                else "Ready for Payment and scheduled for Payment Cycle",
-                "",
-                "ready_for_payment",
-            )
-    elif reg_code == "P" and pay_stat == "H":
-        return "Technical Issue", "", "technical"
-    return "", "", ""
+# AP Advance priority from the VSR "AP Advance & Logic" sheet. When one invoice
+# has several Cora rows, the state listed first decides the status. The states
+# already reflected in JDE (Paid ... Ready For QC) come before priority 1.
+CORA_STATE_PRIORITY = (
+    "paid",
+    "partially paid",
+    "awaiting payment feed",
+    "ready for qc",
+    "awaiting posting acknowledgement",   # 1
+    "awaiting gr",                        # 2
+    "awaiting approval",                  # 3
+    "ready for gr posting",               # 4
+    "ready for gr creation",              # 5
+    "awaiting variance or fmi approval",  # 6
+    "ready for business help",            # 7
+    "awaiting mdm team response",         # 8
+    "invoice posting error",              # 9
+    "ready for coding by ap",             # 10
+    "ready for manual processing",        # 11
+    "pending for cora validation",        # 12
+    "awaiting ocr response",              # 13
+    "returned",                           # 14
+    "cancelled",                          # 15
+    "ready for archival",                 # 16
+    "archived",                           # 17
+    "reversed",                           # 18
+)
+_CORA_RANK = {state: rank for rank, state in enumerate(CORA_STATE_PRIORITY)}
+
+READY_FOR_PAYMENT_STATES = {"awaiting payment feed", "ready for qc"}
+PENDING_APPROVAL_REASONS = {
+    "awaiting approval": "Approval Required",
+    "ready for gr creation": "GR creation",
+    "awaiting variance or fmi approval": "Variance or FMI Approval",
+    "ready for coding by ap": "Coding by AP",
+}
+UNDER_PROCESSING_STATES = {
+    "awaiting posting acknowledgement",
+    "awaiting gr",
+    "ready for gr posting",
+    "ready for business help",
+    "awaiting mdm team response",
+    "invoice posting error",
+    "ready for manual processing",
+    "pending for cora validation",
+    "awaiting ocr response",
+    "reversed",
+    # Not in the VSR sheet, but internal processing steps.
+    "under processing",
+    "ready for posting",
+    "qc corrections",
+}
 
 
-def _cora_status(matched_cora):
+def _cora_sort_key(candidate, amount_soa):
+    state = candidate["Current State"].lower()
+    return (
+        _CORA_RANK.get(state, len(CORA_STATE_PRIORITY)),
+        not _amount_matches(candidate["Total Amount"], amount_soa),
+    )
+
+
+def _reason(*values):
+    """First meaningful reason; the generic 'Others' category is skipped."""
+    for value in values:
+        text = (value or "").strip().rstrip(".").strip()
+        if text and text.lower() != "others":
+            return text
+    return ""
+
+
+def _rejected_status(matched_cora):
+    reason = _reason(matched_cora["Return Comment"], matched_cora["Return Reason"])
+    status = f"Rejected due to {reason or 'Reason Mentioned in AP Advance'}"
+    owner = matched_cora["Cora Current Owner"]
+    return f"{status} by {owner}" if owner and owner.lower() != "cora" else status
+
+
+def _cancelled_status(matched_cora):
+    reason = _reason(matched_cora["Cancel Reason"], matched_cora["Return Comment"])
+    return f"Cancelled due to {reason or 'Reason Mentioned in AP Advance'}"
+
+
+def _jde_status(matched_jde, cora_payment_date, as_of):
+    """JDE decides first: invoices present in JDE are paid or awaiting payment."""
+    if not matched_jde:
+        return "", ""
+
+    lines = [(reg, stat) for reg, stat in matched_jde["Lines"] if stat]
+    if not lines:
+        return "", ""
+    paid = [stat == "P" for _, stat in lines]
+    held = any(stat == "H" and reg in ["L", ""] for reg, stat in lines)
+
+    if all(paid):
+        payment_date = format_date_ddmmyyyy(cora_payment_date)
+        return (f"Paid in full on {payment_date}" if payment_date else "Paid in full"), ""
+    if held and any(paid):
+        return "Partially Paid", ""
+    if held:
+        return payment_cycle_status(matched_jde["Due Date"], as_of), ""
+    return "", ""
+
+
+def _cora_status(matched_cora, as_of):
     if not matched_cora or not matched_cora["Current State"]:
-        return "", "", ""
+        return "", ""
 
-    cora_state = matched_cora["Current State"]
-    cora_state_lower = cora_state.lower()
+    cora_state_lower = matched_cora["Current State"].lower()
     cora_owner = matched_cora["Cora Current Owner"]
 
     if cora_state_lower == "paid":
         payment_date = format_date_ddmmyyyy(matched_cora.get("Payment Date"))
-        return (
-            f"Paid in full on {payment_date}" if payment_date else "Paid in full",
-            "",
-            "paid",
-        )
+        return (f"Paid in full on {payment_date}" if payment_date else "Paid in full"), ""
 
     if cora_state_lower == "partially paid":
         payment_date = format_date_ddmmyyyy(matched_cora.get("Payment Date"))
         return (
-            f"Partially paid on {payment_date}" if payment_date else "Partially paid",
+            f"Partially Paid on {payment_date}" if payment_date else "Partially Paid",
             cora_owner,
-            "partially_paid",
         )
 
-    if cora_state_lower == "awaiting payment feed":
-        month_name = get_month_name(
-            matched_cora.get("Pay By Date")
-            or matched_cora.get("Payment Date")
-            or matched_cora.get("Invoice Date")
+    if cora_state_lower in READY_FOR_PAYMENT_STATES:
+        # Blank Excel cells arrive as NaN, which is truthy, so test real dates.
+        due_date = next(
+            (
+                matched_cora.get(column) for column in ("Pay By Date", "Payment Date", "Invoice Date")
+                if _to_datetime(matched_cora.get(column)) is not None
+            ),
+            None,
         )
-        return (
-            f"Ready for Payment and scheduled for {month_name} Payment Cycle"
-            if month_name
-            else "Ready for Payment and scheduled for Payment Cycle",
-            "",
-            "ready_for_payment",
-        )
+        return payment_cycle_status(due_date, as_of), ""
 
-    if cora_state_lower in [
-        "awaiting approval",
-        "awaiting variance or fmi approval",
-        "ready for gr creation",
-        "ready for business help",
-    ]:
+    if cora_state_lower in PENDING_APPROVAL_REASONS:
         buyer = cora_owner if cora_owner and cora_owner.lower() != "cora" else "Approver"
-        if cora_state_lower == "ready for gr creation":
-            reason = "GR Loading"
-        elif cora_state_lower == "awaiting variance or fmi approval":
-            reason = "Variance or FMI Approval"
-        elif cora_state_lower == "ready for business help":
-            reason = matched_cora.get("Biz Reason") or "Business Help Confirmation"
-        else:
-            reason = "Approval Required"
-        return f"Pending Approval from {buyer} due to {reason}", buyer, "pending_approval"
+        reason = PENDING_APPROVAL_REASONS[cora_state_lower]
+        return f"Pending Approval from {buyer} due to {reason}", buyer
 
-    if cora_state_lower in [
-        "under processing",
-        "awaiting gr",
-        "awaiting mdm team response",
-        "awaiting ocr response",
-        "awaiting posting acknowledgement",
-        "pending for cora validation",
-        "ready for gr posting",
-        "ready for manual processing",
-        "ready for posting",
-        "ready for qc",
-        "ready for archival",
-    ]:
+    if cora_state_lower in UNDER_PROCESSING_STATES:
         pending = cora_owner if cora_owner and cora_owner.lower() != "cora" else ""
-        return (
-            "Under Processing and will be reviewed by the team, should more information be required we will be in touch",
-            pending,
-            "processing",
-        )
+        return UNDER_PROCESSING, pending
 
-    if cora_state_lower in ["returned", "cancelled"]:
-        reason = matched_cora.get("Reason Text") or "Reason Mentioned in AP Advance"
-        person = cora_owner or "AP Team"
-        return f"Rejected due to {reason} by {person}", cora_owner, "rejected"
+    if cora_state_lower == "returned":
+        return _rejected_status(matched_cora), cora_owner
 
-    if cora_state_lower == "invoice posting error":
-        return "Technical Issue", "", "technical"
+    if cora_state_lower == "cancelled":
+        return _cancelled_status(matched_cora), cora_owner
 
-    if cora_state_lower in ["awaiting credit memo", "reversed"]:
+    if cora_state_lower in ["ready for archival", "archived"]:
+        if _reason(matched_cora["Return Comment"], matched_cora["Return Reason"]) or not matched_cora["Cancel Reason"]:
+            return _rejected_status(matched_cora), cora_owner
+        return _cancelled_status(matched_cora), cora_owner
+
+    if cora_state_lower == "awaiting credit memo":
         return (
             "Need Manual Intervention - Please share updated credit memo with invoice number",
             cora_owner,
-            "manual_intervention",
         )
 
-    return "", "", ""
+    return "", ""
+
+
+def _amount_check(amount_soa, jde_amount, cora_amount):
+    """Amount differences are reported beside the status rather than replacing it."""
+    if amount_soa is None:
+        return "SOA amount missing"
+    differences = [
+        f"{label} {_format_amount(value)}"
+        for label, value in (("JDE", jde_amount), ("Cora", cora_amount))
+        if value is not None and not _amount_matches(value, amount_soa)
+    ]
+    if not differences:
+        return ""
+    return f"SOA {_format_amount(amount_soa)} differs from " + ", ".join(differences)
 
 
 def _validate_output_path(output_file, source_paths):
@@ -343,9 +413,10 @@ def _save_workbook_atomic(workbook, output_path):
             os.remove(temp_path)
 
 
-def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_file, logger=print):
+def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_file, logger=print, as_of=None):
     """Create the final workbook while preserving the established source matching order."""
     logger("Creating new reconciliation file...")
+    as_of = pd.Timestamp(as_of or pd.Timestamp.today()).normalize()
 
     soa_source_path = None
     if isinstance(df_soa, (str, os.PathLike)):
@@ -417,9 +488,11 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
                 "alpha_keys": set(),
                 "line_count": 0,
             }
+            rec_data["Lines"] = []
             jde_groups[group_key] = group
 
         group["line_count"] += 1
+        group["record"]["Lines"].append((reg_code, pay_stat))
         if gross_amt is not None:
             group["amounts"].append(gross_amt)
 
@@ -464,20 +537,13 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
         if cora_owner.upper() in ["NAN", "NONE", "NULL"]:
             cora_owner = ""
 
-        reasons = [
-            row.get("Return Reason comments"),
-            row.get("Return Reason"),
-            row.get("Cancel Reason"),
-            row.get("Business Help Reason"),
-        ]
-        reason_text = next(
-            (str(reason).strip() for reason in reasons if pd.notna(reason) and str(reason).strip()),
-            "",
-        )
         total_amount = parse_amount(
             row.get("Total Amount"), source="Cora report Total Amount", row_number=row_number
         )
-        business_reason = row.get("Business Help Reason")
+        reasons = {
+            column: str(row.get(column)).strip() if pd.notna(row.get(column)) else ""
+            for column in ("Return Reason comments", "Return Reason", "Cancel Reason")
+        }
         rec_data = {
             "Invoice No": str(inv_raw).strip(),
             "Current State": cora_state,
@@ -486,8 +552,9 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
             "Payment Date": row.get("Payment Date"),
             "Pay By Date": row.get("Pay By Date"),
             "Invoice Date": row.get("Invoice Date"),
-            "Reason Text": reason_text,
-            "Biz Reason": str(business_reason).strip() if pd.notna(business_reason) else "",
+            "Return Comment": reasons["Return Reason comments"],
+            "Return Reason": reasons["Return Reason"],
+            "Cancel Reason": reasons["Cancel Reason"],
             "Voucher Date": row.get("Voucher Creation Date"),
         }
 
@@ -507,7 +574,7 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
     for row_number, (_, row) in enumerate(df_soa.iterrows(), start=2):
         inv_soa = normalize_key(row.get("Invoice Number"))
         amount_soa = parse_amount(
-            row.get("Amount( Original )"), source="SOA data", row_number=row_number, required=True
+            row.get("Amount( Original )"), source="SOA data", row_number=row_number
         )
         open_amount = parse_amount(
             row.get("Open amount"), source="SOA data Open amount", row_number=row_number
@@ -534,22 +601,20 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
             if not matched_jde:
                 matched_jde = jde_candidates[0]
 
+        # One invoice can have several Cora rows (resubmissions, duplicates).
+        # The AP Advance priority decides which state is reported.
         cora_candidates = cora_exact_map.get(k_norm) or cora_exact_map.get(k_lstrip) or cora_alpha_map.get(k_alpha) or []
-        matched_cora = None
-        if cora_candidates:
-            for candidate in cora_candidates:
-                if _amount_matches(candidate["Total Amount"], amount_soa):
-                    matched_cora = candidate
-                    break
-            if not matched_cora:
-                for candidate in cora_candidates:
-                    if candidate["Current State"].lower() in [
-                        "paid", "awaiting payment feed", "awaiting approval", "under processing", "ready for gr creation"
-                    ]:
-                        matched_cora = candidate
-                        break
-            if not matched_cora:
-                matched_cora = cora_candidates[0]
+        matched_cora = (
+            min(cora_candidates, key=lambda candidate: _cora_sort_key(candidate, amount_soa))
+            if cora_candidates else None
+        )
+        cora_payment_date = next(
+            (
+                candidate["Payment Date"] for candidate in cora_candidates
+                if candidate["Current State"].lower() == "paid" and _to_datetime(candidate["Payment Date"]) is not None
+            ),
+            None,
+        )
 
         reg_code = matched_jde["Reg Code"] if matched_jde else ""
         pay_stat = matched_jde["Pay Stat"] if matched_jde else ""
@@ -558,49 +623,28 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
         cora_state = matched_cora["Current State"] if matched_cora else ""
         cora_owner = matched_cora["Cora Current Owner"] if matched_cora else ""
         cora_amount = matched_cora["Total Amount"] if matched_cora else None
-        jde_amount_match = _amount_matches(jde_amount, amount_soa)
-        cora_amount_match = _amount_matches(cora_amount, amount_soa)
 
-        jde_status, jde_pending, jde_category = _jde_status(matched_jde, jde_amount_match)
-        cora_status, cora_pending, cora_category = _cora_status(matched_cora)
+        # JDE (paid / ready for payment) takes precedence over Cora. A small
+        # amount difference no longer hides the status; it is shown in
+        # "Amount Check" instead.
+        jde_status, jde_pending = _jde_status(matched_jde, cora_payment_date, as_of)
+        cora_status, cora_pending = _cora_status(matched_cora, as_of)
 
-        amounts_conflict = bool(
-            matched_jde and matched_cora and jde_amount is not None and cora_amount is not None
-            and round(jde_amount, 2) != round(cora_amount, 2)
-        )
-        outcomes_conflict = bool(jde_category and cora_category and jde_category != cora_category)
-
-        if amounts_conflict or outcomes_conflict:
-            details = []
-            if amounts_conflict:
-                details.append(
-                    "amounts disagree "
-                    f"(SOA {_format_amount(amount_soa)}, JDE {_format_amount(jde_amount)}, Cora {_format_amount(cora_amount)})"
-                )
-            if outcomes_conflict:
-                details.append(f"JDE: {jde_status}; Cora: {cora_status}")
-            status = "Source conflict - " + "; ".join(details)
-            pending_with = cora_pending or jde_pending
-        elif (
-            (matched_jde and jde_amount is not None and not jde_amount_match)
-            or (matched_cora and cora_amount is not None and not cora_amount_match)
-        ):
-            status = (
-                "Amount mismatch - "
-                f"SOA: {_format_amount(amount_soa)}; JDE: {_format_amount(jde_amount)}; Cora: {_format_amount(cora_amount)}"
-            )
-            pending_with = cora_owner
-        elif jde_status:
+        if jde_status:
             status = jde_status
             pending_with = jde_pending
         elif cora_status:
             status = cora_status
             pending_with = cora_pending
-        elif matched_jde or matched_cora:
+        elif matched_jde:
+            # In JDE but on hold outside the payment run (for example Reg Code P).
+            status = UNDER_PROCESSING
+            pending_with = ""
+        elif matched_cora:
             status = "Matched - Manual review required"
             pending_with = cora_owner
         else:
-            status = "Unmatched"
+            status = MISSING_IN_LEDGER
             pending_with = ""
 
         reconciled_rows.append({
@@ -615,6 +659,7 @@ def create_reconciliation_file(df_soa, cora_file, jde_file, logic_file, output_f
             "Due Date": format_date_ddmmyyyy(due_date),
             "Cora Current State": cora_state,
             "Cora Current Owner": cora_owner,
+            "Amount Check": _amount_check(amount_soa, jde_amount, cora_amount),
             "Source File": source_file,
         })
 
