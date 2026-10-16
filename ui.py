@@ -885,8 +885,7 @@ class ReconApp(tk.Tk):
         self._stop_timer()
         self.result_df = final_df
         review_prefixes = (
-            "Amount mismatch", "Source conflict", "Unmatched", "Matched - Manual",
-            "Technical Issue", "Need Manual", "Rejected",
+            "Missing in ledger", "Matched - Manual", "Need Manual", "Rejected", "Cancelled",
         )
         review_mask = final_df["Invoice Status"].str.startswith(review_prefixes, na=False)
         review_count = int(review_mask.sum())
@@ -936,7 +935,7 @@ class ReconApp(tk.Tk):
             status = str(row.get("Invoice Status", ""))
             if status.startswith(("Paid in full", "Ready for Payment")):
                 tag = "normal"
-            elif status.startswith(("Pending Approval", "Under Processing", "Partially paid")):
+            elif status.startswith(("Pending Approval", "Under Processing", "Partially Paid")):
                 tag = "progress"
             else:
                 tag = "review"
